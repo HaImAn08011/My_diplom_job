@@ -20,16 +20,16 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# ---------- Безопасность: берём секретный ключ из окружения ----------
+# ---------- Безопасность ----------
 app.secret_key = os.environ.get('SECRET_KEY')
 if not app.secret_key:
     app.secret_key = secrets.token_hex(32)
-    print("⚠️ ВНИМАНИЕ: SECRET_KEY не задан в переменных окружения. Сгенерирован временный ключ.")
+    print("⚠️ ВНИМАНИЕ: SECRET_KEY не задан. Сгенерирован временный ключ.")
 
-# ---------- Локальная блокировка IP (brute force) — исправленная, без падений ----------
+# ---------- Защита от brute force ----------
 failed_attempts = defaultdict(list)
 blocked_ips = {}
-_lock = Lock()  # для потокобезопасности
+_lock = Lock()
 
 def is_ip_blocked(ip):
     with _lock:
@@ -42,7 +42,6 @@ def is_ip_blocked(ip):
 def register_failed_attempt(ip):
     with _lock:
         now = datetime.now()
-        # Очищаем старые попытки (старше 10 минут)
         failed_attempts[ip] = [t for t in failed_attempts[ip] if now - t < timedelta(minutes=10)]
         failed_attempts[ip].append(now)
         if len(failed_attempts[ip]) >= 10:
@@ -50,7 +49,7 @@ def register_failed_attempt(ip):
             return True
         return False
 
-# ---------- Flask-Limiter (дополнительная защита) ----------
+# ---------- Flask-Limiter ----------
 app.config['RATELIMIT_STORAGE_URI'] = 'memory://'
 app.config['RATELIMIT_STRATEGY'] = 'fixed-window'
 app.config['RATELIMIT_HEADERS_ENABLED'] = True
@@ -63,7 +62,7 @@ limiter = Limiter(
 )
 limiter.init_app(app)
 
-# ---------- CSRF защита ----------
+# ---------- CSRF ----------
 csrf = CSRFProtect(app)
 
 @app.context_processor
@@ -80,7 +79,7 @@ def ratelimit_handler(e):
     flash(f"⚠️ Слишком много запросов. {e.description}", 'danger')
     return redirect(request.url)
 
-# ---------- Google OAuth (ключи из переменных окружения) ----------
+# ---------- Google OAuth ----------
 app.config['GOOGLE_CLIENT_ID'] = os.environ.get('GOOGLE_CLIENT_ID')
 app.config['GOOGLE_CLIENT_SECRET'] = os.environ.get('GOOGLE_CLIENT_SECRET')
 if not app.config['GOOGLE_CLIENT_ID'] or not app.config['GOOGLE_CLIENT_SECRET']:
@@ -95,17 +94,43 @@ google = oauth.register(
     client_kwargs={'scope': 'openid email profile'},
 )
 
-# ---------- База данных (абсолютный путь) ----------
-basedir = os.path.abspath(os.path.dirname(__file__))
-DATABASE = os.path.join(basedir, 'database.db')
+# ---------- База данных (постоянный том /data) ----------
+DATABASE = '/data/database.db'
+# Убедимся, что папка /data существует (на Timeweb она будет создана при монтировании тома)
+os.makedirs(os.path.dirname(DATABASE), exist_ok=True)
 
 def get_db_connection():
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
 
+# ---------- Вспомогательные функции ----------
+def get_active_reservation_for_book(book_id):
+    conn = get_db_connection()
+    res = conn.execute('SELECT * FROM reservations WHERE book_id = ? AND status = "active"', (book_id,)).fetchone()
+    conn.close()
+    return res
+
+def count_active_reservations_for_user(user_id):
+    conn = get_db_connection()
+    count = conn.execute('SELECT COUNT(*) as cnt FROM reservations WHERE user_id = ? AND status = "active"', (user_id,)).fetchone()['cnt']
+    conn.close()
+    return count
+
+def generate_pickup_code():
+    chars = [c for c in (string.ascii_uppercase + string.digits) if c not in 'O0I1']
+    while True:
+        code = ''.join(random.choices(chars, k=6))
+        conn = get_db_connection()
+        existing = conn.execute('SELECT id FROM reservations WHERE pickup_code = ? AND status = "active"', (code,)).fetchone()
+        conn.close()
+        if not existing:
+            return code
+
+MAX_ACTIVE_RESERVATIONS = 3
+
 def init_db():
-    """Инициализация БД — вызывается один раз вручную через SSH."""
+    """Инициализация БД — создаёт таблицы и начальные данные."""
     conn = get_db_connection()
     conn.execute('''CREATE TABLE IF NOT EXISTS users 
                     (id INTEGER PRIMARY KEY AUTOINCREMENT, 
@@ -142,6 +167,7 @@ def init_db():
                      FOREIGN KEY (user_id) REFERENCES users (id),
                      FOREIGN KEY (book_id) REFERENCES books (id))''')
     
+    # Добавляем колонку email, если её нет
     columns = conn.execute("PRAGMA table_info(users)").fetchall()
     has_email = any(col['name'] == 'email' for col in columns)
     if not has_email:
@@ -179,33 +205,7 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# Вспомогательные функции для бронирований
-def get_active_reservation_for_book(book_id):
-    conn = get_db_connection()
-    res = conn.execute('SELECT * FROM reservations WHERE book_id = ? AND status = "active"', (book_id,)).fetchone()
-    conn.close()
-    return res
-
-def count_active_reservations_for_user(user_id):
-    conn = get_db_connection()
-    count = conn.execute('SELECT COUNT(*) as cnt FROM reservations WHERE user_id = ? AND status = "active"', (user_id,)).fetchone()['cnt']
-    conn.close()
-    return count
-
-def generate_pickup_code():
-    chars = [c for c in (string.ascii_uppercase + string.digits) if c not in 'O0I1']
-    while True:
-        code = ''.join(random.choices(chars, k=6))
-        conn = get_db_connection()
-        existing = conn.execute('SELECT id FROM reservations WHERE pickup_code = ? AND status = "active"', (code,)).fetchone()
-        conn.close()
-        if not existing:
-            return code
-
-MAX_ACTIVE_RESERVATIONS = 3
-
 # ---------- МАРШРУТЫ ----------
-
 @app.route('/login/google')
 def google_login():
     redirect_uri = url_for('google_auth', _external=True)
@@ -292,7 +292,6 @@ def login():
         conn.close()
         
         if user and user['password'] and check_password_hash(user['password'], password):
-            # успешный вход: очищаем историю неудач для этого IP
             with _lock:
                 if ip in failed_attempts:
                     del failed_attempts[ip]
@@ -577,4 +576,5 @@ def admin_pickup_by_code():
         return redirect(url_for('admin_pickup_by_code'))
     return render_template('admin_pickup_by_code.html')
 
-# ---------- НЕТ блока if __name__ == '__main__' ----------
+# ---------- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (только после всех маршрутов) ----------
+init_db()
